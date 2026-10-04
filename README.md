@@ -8,6 +8,8 @@ TypeScript / Node.js + PostgreSQL 实现的危险货箱三维舱位配载审定�
 
 清单签发后，现场以该冻结清单为基准开启**装船核对作业（check job）**：逐箱上报实装位置或撤销（未装），以每箱最后一条上报确定当前状态，服务实时给出应装/已核对/缺失/错位/清单外箱明细；全部与冻结清单一致且无清单外箱方可结案冻结，之后拒绝新上报。核对基准一经开工即固定，后续布局调整、**约束变更**或新签发清单均不影响在办作业。
 
+调度员还可从航次当前修订号建立多个相互独立的**试排方案（stowage plan）**：每个方案以创建时布局为初值、固定当时安全约束快照，记录来源修订号与独立的方案修订号；方案内整批调整沿用正式航次同一套箱号/坐标/最终布局校验规则，按方案修订号防止并发覆盖，失败不改变方案，且**正式航次、清单与核对作业不受试排影响**。仅当航次当前修订号仍等于方案来源修订号时方可**发布**：方案布局原子写入航次新修订号并继承方案约束；否则报告冲突且保留方案。发布成功后方案只读，重复发布幂等返回首次发布结果。
+
 ---
 
 ## 1. 模型与规则
@@ -80,6 +82,15 @@ d = |Δbay| + |Δrow| + |Δtier|
 
 > 布局调整（`/moves`）与约束变更（`/constraints`）都会使修订号 +1 并各自把“不变的另一半”快照复制到新修订号：`/moves` 沿用当前约束、生成新布局；`/constraints` 沿用当前布局、写入新约束。
 
+### 试排方案语义（`POST /voyages/:id/plans` 等）
+
+- **建立**：`POST /api/voyages/:id/plans` 以航次**当前修订号**为来源建立独立方案——复制当前布局为方案初值（方案修订号 `planRevision=0`），并把当时生效的整套约束**固定**为方案快照（方案存续期间不变）；同一航次可建立多个相互独立的方案，`label` 可空仅作备注；
+- **方案内整批调整**：`POST /api/plans/:planId/moves` 与正式航次 `/moves` 同构——携带所见**方案修订号** `baseRevision`，沿用同一套箱号/坐标/最终布局五项校验规则（请求级错误 400、规则违反 422、过期 409 `stale_revision` 返回方案当前修订号）；**失败不改变方案**；受理后方案修订号 +1，正式航次修订号与布局不受任何影响；
+- **查询**：`GET /api/plans/:planId` 返回当前试排布局、固定约束与版本（`sourceRevision`/`planRevision`/`status`）；未知方案 404 `plan_not_found`；`GET /api/voyages/:id/plans` 列出航次下全部方案；
+- **发布**：`POST /api/plans/:planId/publish` 仅当**航次当前修订号仍等于方案来源修订号**才受理——同一事务内把方案布局写入航次新修订号（rev+1）、新修订号继承方案约束快照、方案置 `published` 只读；航次修订号已偏离 → 409 `publish_conflict`，**方案原样保留**（仍为 `open`，可继续调整或基于最新修订号另建方案）；
+- **发布后**：方案只读（继续调整 → 409 `plan_published`）；重复发布幂等返回**首次发布结果**（200 `replay:true`，不产生新修订号）；
+- **隔离与冻结**：试排不触碰正式航次、清单与核对作业；历史布局、旧清单与在办核对仍遵循原有冻结语义，发布产生的新修订号与正式调整产生的修订号完全同构（历史可查、可签发、可开工核对）。
+
 ---
 
 ## 2. 一键启动（Docker Compose）
@@ -140,6 +151,7 @@ npm test           # 纯函数单元测试（配载规则 + 装船核对）
 npm run build && node test/e2e.js             # 配载/签发/并发
 npm run build && node test/e2e-check.js       # 核对作业/上报/结案/并发
 npm run build && node test/e2e-constraints.js # 安全约束变更/历史留痕/冻结基准/并发
+npm run build && node test/e2e-plans.js       # 试排方案/发布冲突/只读幂等/并发
 ```
 
 ---
@@ -165,6 +177,11 @@ npm run build && node test/e2e-constraints.js # 安全约束变更/历史留痕/
 | `POST` | `/api/check-jobs/:jobId/reports` | **核对上报**（实装位置/撤销 + 唯一上报号） |
 | `GET` | `/api/check-jobs/:jobId/reports` | 上报留痕 |
 | `POST` | `/api/check-jobs/:jobId/close` | **结案冻结**（有差异返回 409，作业继续开放） |
+| `POST` | `/api/voyages/:id/plans` | **建立试排方案**（以当前布局为初值、固定当前约束快照） |
+| `GET` | `/api/voyages/:id/plans` | 航次下试排方案列表 |
+| `GET` | `/api/plans/:planId` | 查询方案（当前试排布局 + 固定约束 + 版本） |
+| `POST` | `/api/plans/:planId/moves` | **方案内整批调整**（携带方案修订号） |
+| `POST` | `/api/plans/:planId/publish` | **发布方案**（原子写入航次新修订号；冲突 409 保留方案） |
 | `GET` | `/health` | 健康检查（含数据库连通性） |
 
 ### 4.1 登记航次
@@ -368,15 +385,75 @@ curl -sS -X POST http://localhost:3000/api/check-jobs/<jobId>/close
 
 **并发**：所有上报与结案在事务内对作业行 `SELECT ... FOR UPDATE`，严格顺序生效；并发上报的 `seq` 连续无重复，上报与结案并发时以获得锁的先后为准（结案先到则新上报被拒，上报先到则按当时状态判定结案）。
 
+### 4.8 试排方案（建立 → 方案内调整 → 发布）
+
+试排方案是正式航次旁的独立工作区：建立时快照当前布局与约束，方案内调整只演进**方案修订号**，正式发布时才触碰航次。
+
+**建立**（从航次当前修订号派生；`label` 可省）：
+
+```bash
+curl -sS -X POST http://localhost:3000/api/voyages/<id>/plans \
+  -H 'content-type: application/json' -d '{ "label": "方案A-加密堆存" }'
+```
+
+响应（201；初值=创建时布局，约束=当时生效快照，`planRevision=0`）：
+
+```json
+{ "planId": "…uuid…", "voyageId": "…", "label": "方案A-加密堆存", "status": "open",
+  "sourceRevision": 1, "planRevision": 0, "publishedAt": null, "publishedRevision": null,
+  "geometry": { "bays": 3, "rows": 3, "tiers": 2 },
+  "defaultColumnWeightLimit": "10000",
+  "columnWeightLimits": [ { "bay": 1, "row": 1, "weightLimit": "1200" } ],
+  "incompatRules": [ { "categoryA": "1", "categoryB": "3", "minDistance": 3 } ],
+  "boxes": [ … ], "placements": [ … ], "unplacedBoxNos": [] }
+```
+
+**方案内整批调整**（与 `/moves` 同一套请求体与校验；`baseRevision` 为**方案修订号**）：
+
+```bash
+curl -sS -X POST http://localhost:3000/api/plans/<planId>/moves \
+  -H 'content-type: application/json' -d '{
+  "baseRevision": 0,
+  "moves": [
+    { "boxNo": "B3", "position": { "bay": 2, "row": 1, "tier": 0 } }
+  ]
+}'
+```
+
+- 成功返回 `{ planRevision, previousPlanRevision, applied, plan }`（`plan` 为方案完整视图）；
+- 规则违反 → 422 `validation_failed`（与正式航次同构），**方案不变**；请求级错误 → 400 `invalid_adjustment`；
+- 方案修订号过期 → 409 `stale_revision`（`details.currentRevision` 为方案当前修订号，`details.planId` 指明方案）；
+- 已发布方案 → 409 `plan_published`。
+
+**查询**：`GET /api/plans/<planId>` 返回当前试排布局、固定约束与版本；未知方案 → 404 `plan_not_found`。`GET /api/voyages/<id>/plans` 返回航次下方案摘要列表。
+
+**发布**：
+
+```bash
+curl -sS -X POST http://localhost:3000/api/plans/<planId>/publish
+```
+
+- 仅当**航次当前修订号仍等于 `sourceRevision`**：同一事务内把方案布局写入航次新修订号、新修订号继承方案约束快照、方案置 `published` 只读 → 201：
+
+  ```json
+  { "published": true, "replay": false, "planId": "…", "voyageId": "…",
+    "sourceRevision": 2, "planRevision": 1, "voyageRevision": 3,
+    "publishedAt": "…", "layout": { "revision": 3, "current": true, … } }
+  ```
+
+- 航次已前进 → 409 `publish_conflict`（`details` 含 `sourceRevision`/`currentRevision`/`planRevision`），**方案保留**仍为 `open`，可继续调整或另建方案；
+- 已发布方案重复发布 → 200 `replay:true`，返回**首次发布结果**（同一 `voyageRevision` 与 `publishedAt`，不产生新修订号）；
+- 发布产生的新修订号与正式调整完全同构：历史布局可查、可据此签发清单、可开启核对作业；既有历史布局、旧清单与在办核对保持冻结。
+
 ### 状态码约定
 
 | 状态 | 场景 |
 | --- | --- |
-| 200 / 201 | 查询成功 / 创建或首次签发、首次受理上报、首次结案成功（幂等重试返回 200） |
-| 400 | 请求体非法、未知箱、坐标越界、同批重复箱号；约束变更的非正承重/越界列坐标/重复类别对或重复列覆盖 |
-| 404 | 航次/修订号/清单/核对作业不存在（含以未签发清单开工） |
-| 409 | 修订号过期（整批调整、约束变更、签发共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案 |
-| 422 | 配载规则违反整批拒绝（整批调整或约束变更复验当前布局）；或尚有箱未配位即签发 |
+| 200 / 201 | 查询成功 / 创建或首次签发、首次受理上报、首次结案成功、首次发布方案（幂等重试返回 200） |
+| 400 | 请求体非法、未知箱、坐标越界、同批重复箱号；约束变更的非正承重/越界列坐标/重复类别对或重复列覆盖；方案 ID 格式非法 |
+| 404 | 航次/修订号/清单/核对作业/试排方案不存在（含以未签发清单开工） |
+| 409 | 修订号过期（整批调整、约束变更、签发、方案内调整共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案；方案已发布（`plan_published`）、航次修订号偏离方案来源（`publish_conflict`） |
+| 422 | 配载规则违反整批拒绝（整批调整、约束变更复验、方案内调整）；或尚有箱未配位即签发 |
 | 503 | `/health` 数据库不可达 |
 
 ---
@@ -401,6 +478,12 @@ curl -sS -X POST http://localhost:3000/api/check-jobs/<jobId>/close
   BASE=http://localhost:3000 bash examples/constraints-curl.sh
   ```
 
+- `examples/plans-curl.sh` —— 试排方案全流程 curl（建立两个独立方案→方案内调整 200/422/409→查询方案→正式航次不受影响→发布冲突 409 保留方案→新方案发布 201→只读/重复发布幂等→签发与核对照常）：
+
+  ```bash
+  BASE=http://localhost:3000 bash examples/plans-curl.sh
+  ```
+
 - `examples/api.http` —— REST Client / JetBrains HTTP Client 文件（含核对段落）；
 - `examples/demo.ts` —— Node 示例（内置 fetch）：
 
@@ -418,8 +501,9 @@ src/
   check.ts         装船核对纯函数（最后上报汇总、应装/已核对/缺失/错位/清单外、结案条件）
   service.ts       事务编排：乐观修订号、整批调整、签发冻结、并发互斥
   check-service.ts 核对作业事务：开工/上报幂等与冲突/留痕/状态/结案冻结（行级互斥）
+  plan-service.ts  试排方案事务：建立快照/方案内整批调整/查询/发布（方案行 + 航次行互斥）
   db.ts            连接池、等待就绪、幂等建表
-  schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/清单/核对作业与上报）
+  schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/清单/核对作业与上报/试排方案）
   http/            Express 路由与 zod 请求校验
   config.ts errors.ts app.ts start.ts
 test/
@@ -428,6 +512,7 @@ test/
   e2e.js             对真实 PostgreSQL 的端到端/并发验证（开发辅助）
   e2e-check.js       核对作业端到端/并发验证（开发辅助）
   e2e-constraints.js 安全约束变更端到端/历史留痕/并发验证（开发辅助）
+  e2e-plans.js       试排方案端到端/发布冲突/只读幂等/并发验证（开发辅助）
 examples/          curl / .http / Node 调用示例
 Dockerfile  docker-compose.yml
 ```
@@ -441,5 +526,8 @@ Dockerfile  docker-compose.yml
 - 重量以 `BIGINT` 微千克（1kg = 10⁶）存储，精确支持小数重量；
 - `check_jobs` 以 `(voyage_id, manifest_rev)` 唯一引用冻结清单（同一清单最多一个作业，外键随清单删除级联）；
 - `check_reports` 每次受理上报一行：`(job_id, report_no)` 唯一保证上报号幂等、`(job_id, seq)` 唯一记录受理顺序；`revoked=true` 时坐标为空。当前实装状态取每箱 `seq` 最大的一条。
+- `stowage_plans` 记录试排方案：来源修订号 `source_rev`、独立的方案修订号 `rev`、状态（`open`/`published`）与发布结果（`published_rev`/`published_at`，供重复发布幂等重放）；
+- `plan_placements` 按 `(plan_id, rev)` 全量保存方案每个方案修订号的试排布局（与 `placements` 同构留痕）；
+- `plan_constraint_defaults` / `plan_constraint_column_limits` / `plan_constraint_incompat_rules` 保存方案创建时固定的约束快照（每方案一份，不随方案修订号演进）；发布时把方案布局与这套约束原子复制为航次新修订号的 `placements` 与约束快照。
 
 > 从早期“约束不随修订号留痕”的版本升级时，`src/schema.sql` 启动会幂等地把旧的 `column_weight_limits` / `incompat_rules`（当时全局且不可变）回填为每个历史修订号的快照，再删除旧表；新库不受影响。

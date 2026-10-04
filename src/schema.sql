@@ -127,6 +127,63 @@ CREATE TABLE IF NOT EXISTS check_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_check_reports_box ON check_reports (job_id, box_no, seq);
 
+-- ---- 试排方案（调度员试排工作区）----
+-- 从航次当前修订号派生的相互独立的试排方案：以创建时布局为初值、固定当时约束快照，
+-- 记录来源修订号 source_rev 与独立的方案修订号 rev（方案内乐观并发）。
+-- 方案内的整批调整只写 plan_placements，不触碰正式航次；发布时才原子写回航次新修订号。
+CREATE TABLE IF NOT EXISTS stowage_plans (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    voyage_id     UUID NOT NULL REFERENCES voyages(id) ON DELETE CASCADE,
+    label         TEXT,
+    -- 来源修订号：创建时航次的当前修订号（发布时据此判定冲突）
+    source_rev    INTEGER NOT NULL CHECK (source_rev >= 0),
+    -- 方案修订号：方案内每接受一批调整 +1，与航次修订号序列相互独立
+    rev           INTEGER NOT NULL DEFAULT 0 CHECK (rev >= 0),
+    status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'published')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at  TIMESTAMPTZ,
+    -- 发布成功时写入的航次新修订号（重复发布据此幂等返回首次结果）
+    published_rev INTEGER CHECK (published_rev >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_stowage_plans_voyage ON stowage_plans (voyage_id, created_at);
+
+-- 方案布局按方案修订号全量留痕（与 placements 同构；每接受一批方案内调整产生一个方案修订号）
+CREATE TABLE IF NOT EXISTS plan_placements (
+    plan_id UUID NOT NULL REFERENCES stowage_plans(id) ON DELETE CASCADE,
+    rev     INTEGER NOT NULL CHECK (rev >= 0),
+    box_no  TEXT NOT NULL,
+    bay     INTEGER NOT NULL CHECK (bay >= 1),
+    row     INTEGER NOT NULL CHECK (row >= 1),
+    tier    INTEGER NOT NULL CHECK (tier >= 0),
+    PRIMARY KEY (plan_id, rev, box_no),
+    UNIQUE (plan_id, rev, bay, row, tier)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_placements_rev ON plan_placements (plan_id, rev);
+
+-- 方案创建时固定的安全约束快照（默认列承重 / 按列覆盖 / 不相容类别对）：
+-- 复制自来源修订号，方案存续期间不变；方案内调整与发布复验均使用这套约束。
+CREATE TABLE IF NOT EXISTS plan_constraint_defaults (
+    plan_id      UUID PRIMARY KEY REFERENCES stowage_plans(id) ON DELETE CASCADE,
+    weight_limit BIGINT NOT NULL CHECK (weight_limit > 0) -- 微千克
+);
+
+CREATE TABLE IF NOT EXISTS plan_constraint_column_limits (
+    plan_id      UUID NOT NULL REFERENCES stowage_plans(id) ON DELETE CASCADE,
+    bay          INTEGER NOT NULL CHECK (bay >= 1),
+    row          INTEGER NOT NULL CHECK (row >= 1),
+    weight_limit BIGINT NOT NULL CHECK (weight_limit > 0), -- 微千克
+    PRIMARY KEY (plan_id, bay, row)
+);
+
+CREATE TABLE IF NOT EXISTS plan_constraint_incompat_rules (
+    plan_id      UUID NOT NULL REFERENCES stowage_plans(id) ON DELETE CASCADE,
+    cat_a        TEXT NOT NULL,
+    cat_b        TEXT NOT NULL,
+    min_distance INTEGER NOT NULL CHECK (min_distance > 0),
+    PRIMARY KEY (plan_id, cat_a, cat_b),
+    CHECK (cat_a <= cat_b)
+);
+
 -- ---- 从“约束不随修订号留痕”的旧结构一次性升级（仅在遗留表存在时执行）----
 -- 旧表：column_weight_limits、incompat_rules（约束登记后全局且不可变，故每个历史修订号生效同一套）。
 -- 为每个航次的每个修订号 0..rev 回填约束快照后删除旧表；新库无此二表，整段跳过。

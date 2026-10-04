@@ -151,3 +151,36 @@ GET {{host}}/api/check-jobs/{{jobId}}/reports
 
 ### 结案：全部一致且无清单外箱才冻结；否则 409 返回差异，作业继续开放
 POST {{host}}/api/check-jobs/{{jobId}}/close
+
+### ---- 试排方案 ----
+
+### 从航次当前修订号建立试排方案（以当前布局为初值、固定当前约束快照；label 可省）
+POST {{host}}/api/voyages/{{id}}/plans
+Content-Type: application/json
+
+{
+  "label": "方案A-加密堆存"
+}
+
+### 航次下的试排方案列表
+GET {{host}}/api/voyages/{{id}}/plans
+
+@planId = 00000000-0000-0000-0000-000000000000
+
+### 查询方案：当前试排布局 + 固定约束 + 版本（来源修订号/方案修订号/状态）
+GET {{host}}/api/plans/{{planId}}
+
+### 方案内整批调整（baseRevision 为方案修订号；与正式航次同一套校验；失败不改变方案）
+POST {{host}}/api/plans/{{planId}}/moves
+Content-Type: application/json
+
+{
+  "baseRevision": 0,
+  "moves": [
+    { "boxNo": "BOX-3", "position": { "bay": 2, "row": 1, "tier": 0 } }
+  ]
+}
+
+### 发布方案：航次当前修订号仍等于方案来源修订号时原子写入航次新修订号并继承方案约束；
+### 否则 409 publish_conflict 且方案保留；已发布方案重复发布幂等返回首次结果
+POST {{host}}/api/plans/{{planId}}/publish

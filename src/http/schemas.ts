@@ -92,6 +92,24 @@ export const issueManifestSchema = z.object({
   expectedRevision: nonNegativeInt,
 });
 
+// ---- 试排方案 ----
+
+/**
+ * 建立试排方案：从航次当前修订号派生独立工作区（以当前布局为初值、固定当前约束快照）。
+ * 请求体可整体省略；label 仅用于区分同一航次下的多个方案。
+ */
+export const createPlanSchema = z
+  .object({
+    label: z.string().trim().min(1, '方案名不能为空').max(64).optional(),
+  })
+  .nullish()
+  .transform((d) => ({ label: d?.label ?? null }));
+
+/**
+ * 方案内整批调整：与正式航次整批调整同构（baseRevision 为方案修订号）。
+ * 直接复用 applyMovesSchema。
+ */
+
 // ---- 现场装船核对 ----
 
 export const openCheckJobSchema = z.object({

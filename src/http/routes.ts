@@ -2,10 +2,12 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { VoyageService } from '../service';
 import { CheckService } from '../check-service';
+import { PlanService } from '../plan-service';
 import { HttpError } from '../errors';
 import {
   applyMovesSchema,
   checkReportSchema,
+  createPlanSchema,
   createVoyageSchema,
   issueManifestSchema,
   openCheckJobSchema,
@@ -14,7 +16,11 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function createApiRouter(service: VoyageService, checkService: CheckService): Router {
+export function createApiRouter(
+  service: VoyageService,
+  checkService: CheckService,
+  planService: PlanService,
+): Router {
   const router = Router();
 
   function parseVoyageId(req: Request): string {
@@ -164,6 +170,58 @@ export function createApiRouter(service: VoyageService, checkService: CheckServi
       .then((v) => res.status(v.replay ? 200 : 201).json(v))
       .catch(next);
   });
+
+  // ---- 试排方案 ----
+
+  // 从航次当前修订号建立试排方案（以当前布局为初值、固定当前约束快照）
+  router.post('/voyages/:id/plans', (req, res, next) => {
+    (async () => {
+      const id = parseVoyageId(req);
+      const input = parseBody(createPlanSchema, req.body);
+      const plan = await planService.createPlan(id, input);
+      res.status(201).json(plan);
+    })().catch(next);
+  });
+
+  // 航次下的试排方案列表
+  router.get('/voyages/:id/plans', (req, res, next) => {
+    const id = parseVoyageId(req);
+    planService.listPlans(id).then((v) => res.json(v)).catch(next);
+  });
+
+  // 查询方案：当前试排布局、固定约束与版本（来源修订号/方案修订号/状态）
+  router.get('/plans/:planId', (req, res, next) => {
+    const planId = parsePlanId(req);
+    planService.getPlan(planId).then((v) => res.json(v)).catch(next);
+  });
+
+  // 方案内整批调整（携带所见方案修订号；与正式航次同一套校验规则；失败不改变方案）
+  router.post('/plans/:planId/moves', (req, res, next) => {
+    const planId = parsePlanId(req);
+    const input = parseBody(applyMovesSchema, req.body);
+    planService
+      .applyMoves(planId, input)
+      .then((v) => res.status(200).json(v))
+      .catch(next);
+  });
+
+  // 发布方案：航次当前修订号仍等于方案来源修订号时，原子写入航次新修订号并继承方案约束；
+  // 否则 409 冲突且保留方案；已发布方案重复发布幂等返回首次结果
+  router.post('/plans/:planId/publish', (req, res, next) => {
+    const planId = parsePlanId(req);
+    planService
+      .publish(planId)
+      .then((v) => res.status(v.replay ? 200 : 201).json(v))
+      .catch(next);
+  });
+
+  function parsePlanId(req: Request): string {
+    const id = req.params['planId'] ?? '';
+    if (!UUID_RE.test(id)) {
+      throw HttpError.badRequest('invalid_plan_id', `试排方案 ID 格式非法: ${id}`);
+    }
+    return id;
+  }
 
   function parseJobId(req: Request): string {
     const id = req.params['jobId'] ?? '';
