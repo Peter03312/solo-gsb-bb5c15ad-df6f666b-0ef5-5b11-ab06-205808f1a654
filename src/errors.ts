@@ -28,6 +28,16 @@ export class HttpError extends Error {
     );
   }
 
+  /** 409 Conflict：试排方案修订号过期（方案自有修订序列，与航次修订号相互独立） */
+  static stalePlanRevision(actual: number, expected: number): HttpError {
+    return new HttpError(
+      409,
+      'stale_revision',
+      `试排方案修订号已过期：携带的 ${expected} 与方案当前修订号 ${actual} 不一致，请重新读取方案布局后再提交`,
+      { revisionScope: 'plan', expectedRevision: expected, currentRevision: actual },
+    );
+  }
+
   /** 409 Conflict：核对作业相关冲突（重复开工 / 上报号冲突 / 结案拒绝 / 作业已结案） */
   static conflict(code: string, message: string, details?: unknown): HttpError {
     return new HttpError(409, code, message, details);

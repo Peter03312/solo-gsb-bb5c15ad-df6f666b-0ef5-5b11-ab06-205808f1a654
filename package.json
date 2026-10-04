@@ -12,6 +12,8 @@
     "test": "node --require tsx/cjs --test test/validator.test.ts test/check.test.ts",
     "e2e": "node test/e2e.js",
     "e2e:check": "node test/e2e-check.js",
+    "e2e:constraints": "node test/e2e-constraints.js",
+    "e2e:plans": "node test/e2e-stowage-plans.js",
     "demo": "tsx examples/demo.ts"
   },
   "dependencies": {

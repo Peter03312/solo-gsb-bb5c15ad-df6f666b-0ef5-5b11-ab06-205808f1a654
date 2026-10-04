@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { createApiRouter, errorHandler } from './http/routes';
 import { VoyageService } from './service';
 import { CheckService } from './check-service';
+import { StowagePlanService } from './stowage-plan-service';
 import { ping } from './db';
 
 export function createApp(pool: Pool): express.Express {
@@ -19,7 +20,8 @@ export function createApp(pool: Pool): express.Express {
 
   const service = new VoyageService(pool);
   const checkService = new CheckService(pool);
-  app.use('/api', createApiRouter(service, checkService));
+  const stowagePlanService = new StowagePlanService(pool);
+  app.use('/api', createApiRouter(service, checkService, stowagePlanService));
 
   app.use((_req, res) => {
     res.status(404).json({ error: { code: 'route_not_found', message: '接口不存在' } });

@@ -92,6 +92,23 @@ export const issueManifestSchema = z.object({
   expectedRevision: nonNegativeInt,
 });
 
+// ---- 试排方案（stowage plan）----
+
+/**
+ * 建立试排方案：默认从航次【当前修订号】fork；可显式携带所见 baseRevision
+ * （与当前不一致 -> 409 stale_revision），用于“读后确认未被他人改过再建”。
+ */
+export const createStowagePlanSchema = z
+  .object({
+    baseRevision: nonNegativeInt.optional(),
+  })
+  .transform((d) => ({ baseRevision: d.baseRevision }));
+
+/**
+ * 方案内整批调整：与正式 /moves 同构，但 baseRevision 是【方案修订号 planRevision】。
+ */
+export const planMovesSchema = applyMovesSchema;
+
 // ---- 现场装船核对 ----
 
 export const openCheckJobSchema = z.object({

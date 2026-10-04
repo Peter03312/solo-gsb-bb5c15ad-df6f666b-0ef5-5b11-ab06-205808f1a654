@@ -127,6 +127,39 @@ CREATE TABLE IF NOT EXISTS check_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_check_reports_box ON check_reports (job_id, box_no, seq);
 
+-- ---- 试排方案（stowage plan）：从航次当前修订号 fork 的独立沙箱 ----
+-- 调度员可从航次【当前修订号】建立多个相互独立的试排方案：
+--  - source_rev：方案来源修订号（创建时的航次当前修订号），同时固定当时的安全约束快照——
+--    constraint_defaults / constraint_column_limits / constraint_incompat_rules 按
+--    (voyage_id, source_rev) 直接引用既有不可变快照，无需另存；
+--  - plan_rev：方案自身的修订号（创建时为 0），方案内整批调整按它做乐观并发，与航次修订序列无关；
+--  - 试排期间正式航次、清单、核对作业均不受影响；
+--  - 发布仅当航次当前修订号仍等于 source_rev 时，把方案布局原子写入航次新修订号并继承 source_rev 约束；
+--  - 发布成功后 status='published'、方案只读；published_voyage_rev 记录首次发布写入的正式修订号。
+CREATE TABLE IF NOT EXISTS stowage_plans (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    voyage_id             UUID NOT NULL REFERENCES voyages(id) ON DELETE CASCADE,
+    source_rev            INTEGER NOT NULL CHECK (source_rev >= 0),
+    plan_rev              INTEGER NOT NULL DEFAULT 0 CHECK (plan_rev >= 0),
+    status                TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    published_voyage_rev  INTEGER CHECK (published_voyage_rev IS NULL OR published_voyage_rev >= 0),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at          TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_stowage_plans_voyage ON stowage_plans (voyage_id, created_at);
+
+-- 方案【当前】试排布局：每方案每箱至多一行；方案调整在校验通过后整批替换（DELETE+INSERT），
+-- 任一规则违反或修订号过期都在事务内回滚，方案保持原状。未配位的箱不在此表中。
+CREATE TABLE IF NOT EXISTS stowage_plan_placements (
+    plan_id UUID NOT NULL REFERENCES stowage_plans(id) ON DELETE CASCADE,
+    box_no  TEXT NOT NULL,
+    bay     INTEGER NOT NULL CHECK (bay >= 1),
+    row     INTEGER NOT NULL CHECK (row >= 1),
+    tier    INTEGER NOT NULL CHECK (tier >= 0),
+    PRIMARY KEY (plan_id, box_no),
+    UNIQUE (plan_id, bay, row, tier)
+);
+
 -- ---- 从“约束不随修订号留痕”的旧结构一次性升级（仅在遗留表存在时执行）----
 -- 旧表：column_weight_limits、incompat_rules（约束登记后全局且不可变，故每个历史修订号生效同一套）。
 -- 为每个航次的每个修订号 0..rev 回填约束快照后删除旧表；新库无此二表，整段跳过。

@@ -2,19 +2,26 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { VoyageService } from '../service';
 import { CheckService } from '../check-service';
+import { StowagePlanService } from '../stowage-plan-service';
 import { HttpError } from '../errors';
 import {
   applyMovesSchema,
   checkReportSchema,
+  createStowagePlanSchema,
   createVoyageSchema,
   issueManifestSchema,
   openCheckJobSchema,
+  planMovesSchema,
   updateConstraintsSchema,
 } from './schemas';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function createApiRouter(service: VoyageService, checkService: CheckService): Router {
+export function createApiRouter(
+  service: VoyageService,
+  checkService: CheckService,
+  stowagePlanService: StowagePlanService,
+): Router {
   const router = Router();
 
   function parseVoyageId(req: Request): string {
@@ -115,6 +122,57 @@ export function createApiRouter(service: VoyageService, checkService: CheckServi
     }
     service.getManifest(id, Number(raw)).then((v) => res.json(v)).catch(next);
   });
+
+  // ---- 试排方案（独立沙箱：方案修订号与航次修订号互不影响）----
+
+  // 航次下的试排方案列表
+  router.get('/voyages/:id/stowage-plans', (req, res, next) => {
+    const id = parseVoyageId(req);
+    stowagePlanService.listPlans(id).then((v) => res.json(v)).catch(next);
+  });
+
+  // 从航次当前修订号建立试排方案（可携带 baseRevision 做读后确认）
+  router.post('/voyages/:id/stowage-plans', (req, res, next) => {
+    const id = parseVoyageId(req);
+    const input = parseBody(createStowagePlanSchema, req.body);
+    stowagePlanService
+      .createPlan(id, input)
+      .then((v) => res.status(201).json(v))
+      .catch(next);
+  });
+
+  // 查询方案：当前试排布局 + 创建时固定约束 + 来源/方案/发布版本
+  router.get('/stowage-plans/:planId', (req, res, next) => {
+    const planId = parsePlanId(req);
+    stowagePlanService.getPlan(planId).then((v) => res.json(v)).catch(next);
+  });
+
+  // 方案内整批调整（baseRevision 为方案修订号；失败不改变方案）
+  router.post('/stowage-plans/:planId/moves', (req, res, next) => {
+    const planId = parsePlanId(req);
+    const input = parseBody(planMovesSchema, req.body);
+    stowagePlanService
+      .applyMoves(planId, input)
+      .then((v) => res.status(200).json(v))
+      .catch(next);
+  });
+
+  // 发布方案：来源修订号仍是航次当前修订号时原子写入航次新修订号，否则冲突保留方案
+  router.post('/stowage-plans/:planId/publish', (req, res, next) => {
+    const planId = parsePlanId(req);
+    stowagePlanService
+      .publishPlan(planId)
+      .then((v) => res.status(v.replay ? 200 : 201).json(v))
+      .catch(next);
+  });
+
+  function parsePlanId(req: Request): string {
+    const id = req.params['planId'] ?? '';
+    if (!UUID_RE.test(id)) {
+      throw HttpError.badRequest('invalid_stowage_plan_id', `试排方案 ID 格式非法: ${id}`);
+    }
+    return id;
+  }
 
   // ---- 现场装船核对 ----
 

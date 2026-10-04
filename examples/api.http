@@ -151,3 +151,45 @@ GET {{host}}/api/check-jobs/{{jobId}}/reports
 
 ### 结案：全部一致且无清单外箱才冻结；否则 409 返回差异，作业继续开放
 POST {{host}}/api/check-jobs/{{jobId}}/close
+
+### ============================================================
+### 试排方案（stowage plan）：从当前修订号 fork 的独立沙箱
+### ============================================================
+
+@planId = 00000000-0000-0000-0000-000000000000
+
+### 建立试排方案（请求体可空 = 从当前修订号 fork；可带 baseRevision 读后确认）
+POST {{host}}/api/voyages/{{id}}/stowage-plans
+Content-Type: application/json
+
+{}
+
+### 建立试排方案（显式携带所见航次修订号，过期 -> 409 stale_revision）
+POST {{host}}/api/voyages/{{id}}/stowage-plans
+Content-Type: application/json
+
+{
+  "baseRevision": 1
+}
+
+### 航次下方案列表（版本/状态/已配位箱数；不含布局明细）
+GET {{host}}/api/voyages/{{id}}/stowage-plans
+
+### 查询方案：当前试排布局 + 创建时固定约束 + 来源/方案/航次版本
+GET {{host}}/api/stowage-plans/{{planId}}
+
+### 方案内整批调整（baseRevision 为方案修订号；失败不改变方案）
+POST {{host}}/api/stowage-plans/{{planId}}/moves
+Content-Type: application/json
+
+{
+  "baseRevision": 0,
+  "moves": [
+    { "boxNo": "BOX-2", "position": { "bay": 2, "row": 2, "tier": 0 } },
+    { "boxNo": "BOX-3", "position": null }
+  ]
+}
+
+### 发布方案：来源修订号仍是航次当前修订号 -> 201 原子写入新修订号并继承约束；
+### 航次已演进 -> 409 plan_publish_conflict（方案保留）；已发布重复发布 -> 200 replay
+POST {{host}}/api/stowage-plans/{{planId}}/publish

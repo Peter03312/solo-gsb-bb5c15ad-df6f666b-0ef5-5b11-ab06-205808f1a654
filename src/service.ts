@@ -70,7 +70,7 @@ export interface ConstraintSnapshot {
   rules: Map<string, number>;
 }
 
-interface VoyageRow {
+export interface VoyageRow {
   id: string;
   voyage_no: string;
   n_bays: number;
@@ -79,6 +79,30 @@ interface VoyageRow {
   default_column_limit: bigint;
   rev: number;
   created_at: Date;
+}
+
+/** 布局序列化中“布局 + 约束 + 箱档案”的公共字段（正式布局与试排方案共用） */
+export function buildLayoutFields(data: LoadedVoyageData) {
+  const placedBoxNos = new Set(data.placements.map((p) => p.boxNo));
+  return {
+    geometry: data.geometry,
+    defaultColumnWeightLimit: microToWeight(data.constraints.defaultLimit),
+    columnWeightLimits: [...data.constraints.columnLimits.entries()].map(([key, limit]) => {
+      const [bay, row] = key.split('/').map(Number);
+      return { bay, row, weightLimit: microToWeight(limit) };
+    }),
+    boxes: data.boxes,
+    incompatRules: [...data.constraints.rules.entries()].map(([key, minDistance]) => {
+      const [categoryA, categoryB] = key.split('|');
+      return { categoryA, categoryB, minDistance };
+    }),
+    placements: data.placements
+      .map((p) => ({ boxNo: p.boxNo, position: p.position }))
+      .sort((a, b) => a.boxNo.localeCompare(b.boxNo)),
+    unplacedBoxNos: data.boxes
+      .filter((b) => !placedBoxNos.has(b.boxNo))
+      .map((b) => b.boxNo),
+  };
 }
 
 export interface VoyageJson {
@@ -182,7 +206,7 @@ function validateConstraintInputs(
 
 /* ---------- 读取辅助 ---------- */
 
-interface LoadedVoyageData {
+export interface LoadedVoyageData {
   geometry: Geometry;
   boxes: BoxInfo[];
   /** 当前加载修订号生效的约束 */
@@ -190,7 +214,7 @@ interface LoadedVoyageData {
   placements: Placement[];
 }
 
-async function loadVoyageRow(
+export async function loadVoyageRow(
   client: PoolClient,
   id: string,
   forUpdate: boolean,
@@ -206,7 +230,7 @@ async function loadVoyageRow(
 }
 
 /** 读取航次箱档案（不可变更） */
-async function loadBoxes(client: PoolClient, voyageId: string): Promise<BoxInfo[]> {
+export async function loadBoxes(client: PoolClient, voyageId: string): Promise<BoxInfo[]> {
   const boxRes = await client.query(
     `SELECT box_no, weight_ug::text AS weight_ug, category FROM boxes WHERE voyage_id=$1 ORDER BY box_no`,
     [voyageId],
@@ -219,7 +243,7 @@ async function loadBoxes(client: PoolClient, voyageId: string): Promise<BoxInfo[
 }
 
 /** 读取某修订号生效的约束快照（默认列承重 + 按列覆盖 + 不相容规则） */
-async function loadConstraints(
+export async function loadConstraints(
   client: PoolClient,
   voyageId: string,
   rev: number,
@@ -469,29 +493,12 @@ export class VoyageService {
   }
 
   private serializeLayout(v: VoyageRow, rev: number, data: LoadedVoyageData) {
-    const placedBoxNos = new Set(data.placements.map((p) => p.boxNo));
     return {
       voyageId: v.id,
       voyageNo: v.voyage_no,
       revision: rev,
       current: rev === v.rev,
-      geometry: data.geometry,
-      defaultColumnWeightLimit: microToWeight(data.constraints.defaultLimit),
-      columnWeightLimits: [...data.constraints.columnLimits.entries()].map(([key, limit]) => {
-        const [bay, row] = key.split('/').map(Number);
-        return { bay, row, weightLimit: microToWeight(limit) };
-      }),
-      boxes: data.boxes,
-      incompatRules: [...data.constraints.rules.entries()].map(([key, minDistance]) => {
-        const [categoryA, categoryB] = key.split('|');
-        return { categoryA, categoryB, minDistance };
-      }),
-      placements: data.placements
-        .map((p) => ({ boxNo: p.boxNo, position: p.position }))
-        .sort((a, b) => a.boxNo.localeCompare(b.boxNo)),
-      unplacedBoxNos: data.boxes
-        .filter((b) => !placedBoxNos.has(b.boxNo))
-        .map((b) => b.boxNo),
+      ...buildLayoutFields(data),
     };
   }
 
@@ -588,8 +595,8 @@ export class VoyageService {
     }
   }
 
-  /** 把某修订号的整套约束快照复制到另一修订号（布局调整时沿用约束） */
-  private async copyConstraintSnapshot(
+  /** 把某修订号的整套约束快照复制到另一修订号（布局调整/试排发布时沿用约束） */
+  async copyConstraintSnapshot(
     client: PoolClient,
     voyageId: string,
     fromRev: number,
